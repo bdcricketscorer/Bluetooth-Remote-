@@ -1,0 +1,50 @@
+name: Android APK
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.38.5"
+      - name: Generate Android host project
+        run: flutter create --platforms=android --org com.bdcricketscorer build_app
+      - name: Add app sources and Bluetooth HID activity
+        run: |
+          cp pubspec.yaml build_app/pubspec.yaml
+          rm -rf build_app/lib
+          cp -r lib build_app/lib
+          mkdir -p build_app/android/app/src/main/kotlin/com/bdcricketscorer/bd_bluetooth_tv_remote
+          cp android/app/src/main/kotlin/com/bdcricketscorer/bd_bluetooth_tv_remote/MainActivity.kt build_app/android/app/src/main/kotlin/com/bdcricketscorer/bd_bluetooth_tv_remote/MainActivity.kt
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("build_app/android/app/src/main/AndroidManifest.xml")
+          s=p.read_text()
+          permissions='''    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />'''
+          s=s.replace('<application', permissions+'\n    <application',1)
+          s=s.replace('android:label="build_app"', 'android:label="BD Bluetooth TV Remote"')
+          p.write_text(s)
+          p=Path("build_app/android/app/build.gradle.kts")
+          s=p.read_text().replace('namespace = "com.bdcricketscorer.build_app"','namespace = "com.bdcricketscorer.bd_bluetooth_tv_remote"').replace('applicationId = "com.bdcricketscorer.build_app"','applicationId = "com.bdcricketscorer.bd_bluetooth_tv_remote"')
+          p.write_text(s)
+          PY
+      - name: Build release APK
+        working-directory: build_app
+        run: |
+          flutter pub get
+          flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bd-bluetooth-tv-remote
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
