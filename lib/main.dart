@@ -101,7 +101,7 @@ class _RemoteHomeState extends State<RemoteHome> {
         Row(children: [
           Expanded(child: _keyButton('Back', key: 0x29, icon: Icons.arrow_back)),
           const SizedBox(width: 10), Expanded(child: _keyButton('Home', key: 0x4A, icon: Icons.home)),
-          const SizedBox(width: 10), Expanded(child: _keyButton('Menu', key: 0x46, icon: Icons.menu)),
+          const SizedBox(width: 10), Expanded(child: _keyButton('Menu', key: 0x76, icon: Icons.menu)),
         ]),
         const SizedBox(height: 10),
         Row(children: [
