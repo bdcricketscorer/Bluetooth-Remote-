@@ -11,9 +11,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
-import android.net.wifi.WifiManager
 import android.content.Intent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -28,6 +25,7 @@ class MainActivity : FlutterActivity() {
     private var hid: BluetoothHidDevice? = null
     private var pendingStart: MethodChannel.Result? = null
     private var appRegistered = false
+    private var tvConnected = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: Executor by lazy { ContextCompat.getMainExecutor(this) }
 
@@ -48,55 +46,11 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startHid" -> startHid(result)
-                "discoverTvs" -> discoverTvs(result)
                 "sendKey" -> sendKeyboardKey(call.argument<Int>("key") ?: 0, result)
                 "sendConsumer" -> sendConsumer(call.argument<Int>("usage") ?: 0, result)
+                "getHidStatus" -> result.success(mapOf("registered" to appRegistered, "connected" to tvConnected, "device" to (connectedDevice()?.name ?: "")))
                 else -> result.notImplemented()
             }
-        }
-    }
-
-    private fun discoverTvs(result: MethodChannel.Result) {
-        val nsd = getSystemService(Context.NSD_SERVICE) as NsdManager
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val lock = wifi.createMulticastLock("bd-tv-remote-mdns").apply { setReferenceCounted(false) }
-        val found = java.util.Collections.synchronizedMap(LinkedHashMap<String, Map<String, String>>())
-        var finished = false
-        val handler = Handler(Looper.getMainLooper())
-        lateinit var listener: NsdManager.DiscoveryListener
-        fun finish() {
-            if (finished) return
-            finished = true
-            runCatching { nsd.stopServiceDiscovery(listener) }
-            runCatching { if (lock.isHeld) lock.release() }
-            result.success(found.values.toList())
-        }
-        listener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(serviceType: String) {}
-            override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                if (!serviceInfo.serviceType.trimEnd('.').equals("_androidtvremote2._tcp", true)) return
-                @Suppress("DEPRECATION")
-                nsd.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
-                    override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                        val host = serviceInfo.host?.hostAddress ?: return
-                        val name = serviceInfo.serviceName.ifBlank { "Android TV" }
-                        found["$host:6466"] = mapOf("name" to name, "host" to host, "port" to "6467")
-                    }
-                })
-            }
-            override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
-            override fun onDiscoveryStopped(serviceType: String) {}
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) { finish() }
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) { finish() }
-        }
-        try {
-            lock.acquire()
-            nsd.discoverServices("_androidtvremote2._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
-            handler.postDelayed({ finish() }, 8000)
-        } catch (e: Exception) {
-            runCatching { if (lock.isHeld) lock.release() }
-            result.error("DISCOVERY_FAILED", e.message ?: "Could not scan the Wi-Fi network.", null)
         }
     }
 
@@ -129,6 +83,7 @@ class MainActivity : FlutterActivity() {
                 val callback = object : BluetoothHidDevice.Callback() {
                     override fun onAppStatusChanged(device: android.bluetooth.BluetoothDevice?, registered: Boolean) {
                         appRegistered = registered
+                        if (!registered) tvConnected = false
                         if (registered) {
                             try { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)) } catch (_: Exception) {}
                             pendingStart?.success("ready"); pendingStart = null
@@ -136,7 +91,7 @@ class MainActivity : FlutterActivity() {
                             pendingStart?.error("REGISTER_FAILED", "Bluetooth HID registration failed.", null); pendingStart = null
                         }
                     }
-                    override fun onConnectionStateChanged(device: android.bluetooth.BluetoothDevice?, state: Int) { }
+                    override fun onConnectionStateChanged(device: android.bluetooth.BluetoothDevice?, state: Int) { tvConnected = state == BluetoothProfile.STATE_CONNECTED }
                 }
                 try {
                     val sdp = BluetoothHidDeviceAppSdpSettings("BD TV Remote", "Bluetooth HID TV Remote", "BD Remote", BluetoothHidDevice.SUBCLASS1_COMBO, descriptor)
@@ -158,7 +113,7 @@ class MainActivity : FlutterActivity() {
                     pendingStart?.error("PERMISSION", e.message, null); pendingStart = null
                 }
             }
-            override fun onServiceDisconnected(profile: Int) { hid = null; appRegistered = false }
+            override fun onServiceDisconnected(profile: Int) { hid = null; appRegistered = false; tvConnected = false }
         }, BluetoothProfile.HID_DEVICE)
         if (!opened) { result.error("PROFILE_UNAVAILABLE", "This phone does not expose the Bluetooth HID Device profile.", null); pendingStart = null }
     }
