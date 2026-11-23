@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -30,24 +31,46 @@ class _RemoteHomeState extends State<RemoteHome> {
   String _status = 'Not connected';
   bool _ready = false;
   bool _busy = false;
-  List<Map<String, dynamic>> _tvs = [];
+  Timer? _statusTimer;
+  bool _connected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) => _refreshHidStatus());
+  }
+
+  @override
+  void dispose() {
+    _statusTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refreshHidStatus() async {
+    try {
+      final status = await _bridge.invokeMapMethod<String, dynamic>('getHidStatus');
+      if (!mounted || status == null) return;
+      final connected = status['connected'] == true;
+      if (connected != _connected) {
+        setState(() {
+          _connected = connected;
+          _ready = status['registered'] == true;
+          _status = connected ? 'Connected to ${status['device']?.toString().isNotEmpty == true ? status['device'] : 'HY320mini'}' : (_ready ? 'Remote ready. Pair this phone from the projector Bluetooth settings.' : 'Not connected');
+        });
+      }
+    } on PlatformException { }
+  }
 
   Future<void> _connect() async {
-    setState(() { _busy = true; _status = 'Searching for Android TVs on this Wi-Fi…'; _tvs = []; });
+    setState(() { _busy = true; _status = 'Starting Bluetooth HID remote…'; });
     try {
-      final result = await _bridge.invokeMethod<List<dynamic>>('discoverTvs');
+      await _bridge.invokeMethod<String>('startHid');
       if (!mounted) return;
-      final devices = (result ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
-      setState(() {
-        _tvs = devices;
-        _status = devices.isEmpty
-            ? 'No Android TV found. Make sure TV and phone use the same Wi-Fi.'
-            : 'Found ${devices.length} Android TV device(s). Select your TV.';
-        _ready = false;
-      });
+      setState(() { _ready = true; _status = 'Remote is ready. Pair BD TV Remote from your projector Bluetooth settings.'; });
+      await _refreshHidStatus();
     } on PlatformException catch (e) {
       if (!mounted) return;
-      setState(() { _status = e.message ?? 'TV discovery failed'; _ready = false; });
+      setState(() { _ready = false; _status = e.message ?? 'Bluetooth HID could not start'; });
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -76,7 +99,7 @@ class _RemoteHomeState extends State<RemoteHome> {
     return Scaffold(
       appBar: AppBar(
         title: const Row(children: [Icon(Icons.settings_remote, color: Color(0xFF31D6A0)), SizedBox(width: 10), Text('BD TV Remote', style: TextStyle(fontWeight: FontWeight.bold))]),
-        actions: [IconButton(onPressed: _connect, tooltip: 'Find Android TV', icon: const Icon(Icons.wifi_find))],
+        actions: [IconButton(onPressed: _connect, tooltip: 'Start Bluetooth Remote', icon: const Icon(Icons.bluetooth_searching))],
       ),
       body: SafeArea(child: ListView(padding: const EdgeInsets.fromLTRB(20, 12, 20, 28), children: [
         Container(
@@ -86,28 +109,13 @@ class _RemoteHomeState extends State<RemoteHome> {
             Container(width: 48, height: 48, decoration: BoxDecoration(color: const Color(0xFF31D6A0).withOpacity(.14), borderRadius: BorderRadius.circular(15)), child: const Icon(Icons.bluetooth, color: Color(0xFF31D6A0), size: 28)),
             const SizedBox(width: 13), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(_status, style: const TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4), const Text('Find your Android TV on the same Wi-Fi network, then select it to pair.', style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 4), const Text('Start Bluetooth HID, then pair this phone from the HY320mini Bluetooth menu.', style: TextStyle(color: Colors.white70, fontSize: 12)),
             ])),
             if (_busy) const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
           ]),
         ),
         const SizedBox(height: 15),
-        SizedBox(height: 50, child: FilledButton.icon(onPressed: _busy ? null : _connect, icon: const Icon(Icons.wifi_find), label: const Text('FIND ANDROID TV'))),
-        if (_tvs.isNotEmpty) ...[
-          const SizedBox(height: 16),
-          const Text('ANDROID TV DEVICES', style: TextStyle(color: Color(0xFF8BA69A), letterSpacing: 1.5, fontSize: 11, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          ..._tvs.map((tv) => Card(
-            color: const Color(0xFF172923),
-            child: ListTile(
-              leading: const Icon(Icons.tv, color: Color(0xFF31D6A0)),
-              title: Text(tv['name']?.toString() ?? 'Android TV'),
-              subtitle: Text(tv['host']?.toString() ?? ''),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => setState(() => _status = 'TV found: ${tv['name']}. Secure pairing is the next connection step.'),
-            ),
-          )),
-        ],
+        SizedBox(height: 50, child: FilledButton.icon(onPressed: _busy ? null : _connect, icon: const Icon(Icons.bluetooth_searching), label: const Text('START BLUETOOTH REMOTE'))),
         const SizedBox(height: 24),
         const Text('NAVIGATION', style: TextStyle(color: Color(0xFF8BA69A), letterSpacing: 1.5, fontSize: 11, fontWeight: FontWeight.bold)),
         const SizedBox(height: 12),
@@ -142,7 +150,7 @@ class _RemoteHomeState extends State<RemoteHome> {
         Container(padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: const Color(0xFF111E1A), borderRadius: BorderRadius.circular(17)), child: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('PAIRING GUIDE', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF31D6A0))),
           SizedBox(height: 8),
-          Text('1. Connect your phone and Android TV to the same Wi-Fi network.\n2. Tap FIND ANDROID TV.\n3. Select your TV from the discovered device list.\n4. Complete the secure pairing code shown by the TV.', style: TextStyle(height: 1.6, color: Colors.white70, fontSize: 13)),
+          Text('1. Turn on Bluetooth on your phone and HY320mini.\n2. Tap START BLUETOOTH REMOTE and allow the requested permissions.\n3. On HY320mini, open Settings → Bluetooth / Remotes & Accessories.\n4. Select BD TV Remote (or your phone name) to pair.\n5. When connected, use the buttons below.', style: TextStyle(height: 1.6, color: Colors.white70, fontSize: 13)),
           SizedBox(height: 8),
           Text('Note: Your phone must support Bluetooth HID Device mode and the TV must accept Bluetooth keyboards. Power and some TV-specific keys may not be supported.', style: TextStyle(color: Colors.white54, fontSize: 11, height: 1.5)),
         ])),
