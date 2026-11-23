@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.content.Intent
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -23,6 +25,7 @@ class MainActivity : FlutterActivity() {
     private var hid: BluetoothHidDevice? = null
     private var pendingStart: MethodChannel.Result? = null
     private var appRegistered = false
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: Executor by lazy { ContextCompat.getMainExecutor(this) }
 
     private val descriptor = intArrayOf(
@@ -90,7 +93,19 @@ class MainActivity : FlutterActivity() {
                 try {
                     val sdp = BluetoothHidDeviceAppSdpSettings("BD TV Remote", "Bluetooth HID TV Remote", "BD Remote", BluetoothHidDevice.SUBCLASS1_COMBO, descriptor)
                     val accepted = proxy.registerApp(sdp, null, null, executor, callback)
-                    if (!accepted) { pendingStart?.error("REGISTER_FAILED", "Phone rejected Bluetooth HID registration.", null); pendingStart = null }
+                    // Android documents that registerApp()'s return value is not the
+                    // registration status. Wait for onAppStatusChanged() instead.
+                    mainHandler.postDelayed({
+                        if (pendingStart != null && !appRegistered) {
+                            val reason = if (!accepted) {
+                                "Android did not accept the HID registration request. This can happen if another HID app is registered or the phone's Bluetooth service blocks HID Device mode."
+                            } else {
+                                "Android did not confirm HID registration. The phone firmware may not support third-party Bluetooth HID Device mode."
+                            }
+                            pendingStart?.error("HID_REGISTRATION_TIMEOUT", reason, null)
+                            pendingStart = null
+                        }
+                    }, 6000)
                 } catch (e: SecurityException) {
                     pendingStart?.error("PERMISSION", e.message, null); pendingStart = null
                 }
