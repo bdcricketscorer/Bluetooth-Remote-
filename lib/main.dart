@@ -6,14 +6,15 @@ void main() => runApp(const BluetoothRemoteApp());
 
 class BluetoothRemoteApp extends StatelessWidget {
   const BluetoothRemoteApp({super.key});
+
   @override
   Widget build(BuildContext context) => MaterialApp(
     debugShowCheckedModeBanner: false,
-    title: 'BD Bluetooth TV Remote',
+    title: 'Bluetooth Remote',
     theme: ThemeData(
       brightness: Brightness.dark,
-      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF31D6A0), brightness: Brightness.dark),
-      scaffoldBackgroundColor: const Color(0xFF07110F),
+      colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF269FE5), brightness: Brightness.dark),
+      scaffoldBackgroundColor: const Color(0xFF101010),
       useMaterial3: true,
     ),
     home: const RemoteHome(),
@@ -28,15 +29,18 @@ class RemoteHome extends StatefulWidget {
 
 class _RemoteHomeState extends State<RemoteHome> {
   static const _bridge = MethodChannel('bd_remote/hid');
-  String _status = 'Not connected';
+  String _status = 'Bluetooth remote is not started';
   bool _ready = false;
   bool _busy = false;
-  Timer? _statusTimer;
   bool _connected = false;
+  String _connectedName = '';
+  List<Map<String, dynamic>> _pairedDevices = [];
+  Timer? _statusTimer;
 
   @override
   void initState() {
     super.initState();
+    _refreshHidStatus();
     _statusTimer = Timer.periodic(const Duration(seconds: 2), (_) => _refreshHidStatus());
   }
 
@@ -50,27 +54,55 @@ class _RemoteHomeState extends State<RemoteHome> {
     try {
       final status = await _bridge.invokeMapMethod<String, dynamic>('getHidStatus');
       if (!mounted || status == null) return;
+      final devices = (status['pairedDevices'] as List<dynamic>? ?? [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
       final connected = status['connected'] == true;
-      if (connected != _connected) {
-        setState(() {
-          _connected = connected;
-          _ready = status['registered'] == true;
-          _status = connected ? 'Connected to ${status['device']?.toString().isNotEmpty == true ? status['device'] : 'HY320mini'}' : (_ready ? 'Remote ready. Pair this phone from the projector Bluetooth settings.' : 'Not connected');
-        });
-      }
-    } on PlatformException { }
+      final ready = status['registered'] == true;
+      final name = status['device']?.toString() ?? '';
+      setState(() {
+        _pairedDevices = devices;
+        _connected = connected;
+        _ready = ready;
+        _connectedName = name;
+        if (connected) {
+          _status = 'Connected to ${name.isNotEmpty ? name : 'TV'}';
+        } else if (ready) {
+          _status = 'Bluetooth ready — select a paired TV below';
+        } else if (!_busy) {
+          _status = 'Bluetooth remote is not started';
+        }
+      });
+    } on PlatformException catch (e) {
+      if (mounted && !_busy) setState(() => _status = e.message ?? 'Could not read Bluetooth status');
+    }
   }
 
-  Future<void> _connect() async {
-    setState(() { _busy = true; _status = 'Starting Bluetooth HID remote…'; });
+  Future<void> _startRemote() async {
+    setState(() { _busy = true; _status = 'Starting Bluetooth HID…'; });
     try {
       await _bridge.invokeMethod<String>('startHid');
       if (!mounted) return;
-      setState(() { _ready = true; _status = 'Remote is ready. Pair BD TV Remote from your projector Bluetooth settings.'; });
+      setState(() { _ready = true; _status = 'Bluetooth is ready. Checking paired TVs…'; });
       await _refreshHidStatus();
     } on PlatformException catch (e) {
-      if (!mounted) return;
-      setState(() { _ready = false; _status = e.message ?? 'Bluetooth HID could not start'; });
+      if (mounted) setState(() { _ready = false; _status = e.message ?? 'Bluetooth HID could not start'; });
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _connectDevice(Map<String, dynamic> device) async {
+    final address = device['address']?.toString() ?? '';
+    if (address.isEmpty) return;
+    setState(() { _busy = true; _status = 'Connecting to ${device['name']}…'; });
+    try {
+      await _bridge.invokeMethod<bool>('connectDevice', {'address': address});
+      if (mounted) setState(() => _status = 'Connection request sent to ${device['name']}…');
+      await Future.delayed(const Duration(milliseconds: 700));
+      await _refreshHidStatus();
+    } on PlatformException catch (e) {
+      if (mounted) setState(() => _status = e.message ?? 'Connection failed');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -78,57 +110,107 @@ class _RemoteHomeState extends State<RemoteHome> {
 
   Future<void> _key(int code) async {
     try { await _bridge.invokeMethod('sendKey', {'key': code}); }
-    on PlatformException catch (e) { if (mounted) setState(() => _status = e.message ?? 'Not paired with TV'); }
+    on PlatformException catch (e) { if (mounted) setState(() => _status = e.message ?? 'Not connected to TV'); }
   }
 
   Future<void> _consumer(int usage) async {
     try { await _bridge.invokeMethod('sendConsumer', {'usage': usage}); }
-    on PlatformException catch (e) { if (mounted) setState(() => _status = e.message ?? 'Not paired with TV'); }
+    on PlatformException catch (e) { if (mounted) setState(() => _status = e.message ?? 'Not connected to TV'); }
   }
 
   Widget _keyButton(String label, {int? key, int? usage, IconData? icon, Color? color, double height = 58}) {
     return SizedBox(height: height, child: FilledButton(
-      style: FilledButton.styleFrom(backgroundColor: color ?? const Color(0xFF172923), foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(17))),
-      onPressed: () { if (key != null) _key(key); if (usage != null) _consumer(usage); },
+      style: FilledButton.styleFrom(
+        backgroundColor: color ?? const Color(0xFF242424),
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      ),
+      onPressed: _connected ? () { if (key != null) _key(key); if (usage != null) _consumer(usage); } : null,
       child: icon != null ? Icon(icon, size: 25) : Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
     ));
+  }
+
+  Widget _pairedDeviceCard(Map<String, dynamic> device) {
+    final isConnected = device['connected'] == true;
+    final isConnecting = device['connecting'] == true;
+    final name = device['name']?.toString() ?? 'Bluetooth device';
+    return Card(
+      color: const Color(0xFF242424),
+      margin: const EdgeInsets.only(bottom: 9),
+      child: ListTile(
+        leading: const Icon(Icons.tv, color: Color(0xFF269FE5), size: 28),
+        title: Text(name, style: const TextStyle(fontWeight: FontWeight.w600)),
+        subtitle: Text(isConnected ? 'Connected' : (isConnecting ? 'Connecting…' : 'Paired device')),
+        trailing: isConnected
+            ? const Icon(Icons.check_circle, color: Color(0xFF42C77A))
+            : TextButton(
+                onPressed: (_busy || !_ready) ? null : () => _connectDevice(device),
+                child: const Text('CONNECT'),
+              ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Row(children: [Icon(Icons.settings_remote, color: Color(0xFF31D6A0)), SizedBox(width: 10), Text('BD TV Remote', style: TextStyle(fontWeight: FontWeight.bold))]),
-        actions: [IconButton(onPressed: _connect, tooltip: 'Start Bluetooth Remote', icon: const Icon(Icons.bluetooth_searching))],
+        title: const Text('TV Remote', style: TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
+        actions: [IconButton(onPressed: _refreshHidStatus, tooltip: 'Refresh devices', icon: const Icon(Icons.refresh))],
       ),
-      body: SafeArea(child: ListView(padding: const EdgeInsets.fromLTRB(20, 12, 20, 28), children: [
+      body: SafeArea(child: ListView(padding: const EdgeInsets.fromLTRB(18, 12, 18, 28), children: [
         Container(
-          padding: const EdgeInsets.all(18),
-          decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF153D30), Color(0xFF10231E)]), borderRadius: BorderRadius.circular(22), border: Border.all(color: const Color(0xFF28614D))),
+          padding: const EdgeInsets.all(17),
+          decoration: BoxDecoration(
+            color: const Color(0xFF242424),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: _connected ? const Color(0xFF42C77A) : const Color(0xFF383838)),
+          ),
           child: Row(children: [
-            Container(width: 48, height: 48, decoration: BoxDecoration(color: const Color(0xFF31D6A0).withOpacity(.14), borderRadius: BorderRadius.circular(15)), child: const Icon(Icons.bluetooth, color: Color(0xFF31D6A0), size: 28)),
-            const SizedBox(width: 13), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(_connected ? Icons.bluetooth_connected : Icons.bluetooth, color: _connected ? const Color(0xFF42C77A) : const Color(0xFF269FE5), size: 30),
+            const SizedBox(width: 13),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(_status, style: const TextStyle(fontWeight: FontWeight.bold)),
-              const SizedBox(height: 4), const Text('Start Bluetooth HID, then pair this phone from the HY320mini Bluetooth menu.', style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 4),
+              Text(_connected ? 'Remote controls are active.' : 'Start the remote, then connect a paired TV.', style: const TextStyle(color: Colors.white70, fontSize: 12)),
             ])),
-            if (_busy) const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+            if (_busy) const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
           ]),
         ),
-        const SizedBox(height: 15),
-        SizedBox(height: 50, child: FilledButton.icon(onPressed: _busy ? null : _connect, icon: const Icon(Icons.bluetooth_searching), label: const Text('START BLUETOOTH REMOTE'))),
-        const SizedBox(height: 24),
-        const Text('NAVIGATION', style: TextStyle(color: Color(0xFF8BA69A), letterSpacing: 1.5, fontSize: 11, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        SizedBox(height: 49, child: FilledButton.icon(
+          onPressed: _busy ? null : _startRemote,
+          icon: const Icon(Icons.bluetooth_searching),
+          label: Text(_ready ? 'RESTART BLUETOOTH REMOTE' : 'START BLUETOOTH REMOTE'),
+        )),
+        const SizedBox(height: 22),
+        Row(children: [
+          const Expanded(child: Text('BLUETOOTH DEVICES', style: TextStyle(color: Colors.white70, letterSpacing: 1.2, fontSize: 12, fontWeight: FontWeight.bold))),
+          TextButton.icon(onPressed: _refreshHidStatus, icon: const Icon(Icons.refresh, size: 17), label: const Text('Refresh')),
+        ]),
+        if (_pairedDevices.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: const Color(0xFF1D1D1D), borderRadius: BorderRadius.circular(16)),
+            child: const Text(
+              'No paired Bluetooth devices found. Start the remote, then open HY320mini Bluetooth settings and pair your phone. Return here and tap Refresh.',
+              style: TextStyle(color: Colors.white70, height: 1.5),
+            ),
+          )
+        else
+          ..._pairedDevices.map(_pairedDeviceCard),
+        const SizedBox(height: 22),
+        const Text('REMOTE CONTROL', style: TextStyle(color: Colors.white70, letterSpacing: 1.2, fontSize: 12, fontWeight: FontWeight.bold)),
         const SizedBox(height: 12),
         Center(child: SizedBox(width: 220, child: _keyButton('▲', key: 0x52, height: 58))),
         Center(child: SizedBox(width: 220, child: Row(children: [
           Expanded(child: _keyButton('◀', key: 0x50)), const SizedBox(width: 9),
-          Expanded(child: _keyButton('OK', key: 0x28, color: const Color(0xFF147B5A))), const SizedBox(width: 9),
+          Expanded(child: _keyButton('OK', key: 0x28, color: const Color(0xFF176FA5))), const SizedBox(width: 9),
           Expanded(child: _keyButton('▶', key: 0x4F)),
         ]))),
         Center(child: SizedBox(width: 220, child: _keyButton('▼', key: 0x51))),
-        const SizedBox(height: 22),
-        const Text('CONTROL', style: TextStyle(color: Color(0xFF8BA69A), letterSpacing: 1.5, fontSize: 11, fontWeight: FontWeight.bold)),
-        const SizedBox(height: 12),
+        const SizedBox(height: 18),
         Row(children: [
           Expanded(child: _keyButton('Back', key: 0x29, icon: Icons.arrow_back)),
           const SizedBox(width: 10), Expanded(child: _keyButton('Home', key: 0x4A, icon: Icons.home)),
@@ -146,14 +228,11 @@ class _RemoteHomeState extends State<RemoteHome> {
           const SizedBox(width: 10), Expanded(child: _keyButton('Play / Pause', usage: 0x00CD, icon: Icons.play_arrow)),
           const SizedBox(width: 10), Expanded(child: _keyButton('Next', usage: 0x00B5, icon: Icons.skip_next)),
         ]),
-        const SizedBox(height: 22),
-        Container(padding: const EdgeInsets.all(15), decoration: BoxDecoration(color: const Color(0xFF111E1A), borderRadius: BorderRadius.circular(17)), child: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('PAIRING GUIDE', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF31D6A0))),
-          SizedBox(height: 8),
-          Text('1. Turn on Bluetooth on your phone and HY320mini.\n2. Tap START BLUETOOTH REMOTE and allow the requested permissions.\n3. On HY320mini, open Settings → Bluetooth / Remotes & Accessories.\n4. Select BD TV Remote (or your phone name) to pair.\n5. When connected, use the buttons below.', style: TextStyle(height: 1.6, color: Colors.white70, fontSize: 13)),
-          SizedBox(height: 8),
-          Text('Note: Your phone must support Bluetooth HID Device mode and the TV must accept Bluetooth keyboards. Power and some TV-specific keys may not be supported.', style: TextStyle(color: Colors.white54, fontSize: 11, height: 1.5)),
-        ])),
+        const SizedBox(height: 20),
+        const Text(
+          'First-time pairing: start the remote and approve the discoverable prompt. On HY320mini, open Bluetooth settings and pair with “Bluetooth Remote”. Once paired, select the TV from the device list above.',
+          style: TextStyle(color: Colors.white54, fontSize: 12, height: 1.5),
+        ),
       ])),
     );
   }
