@@ -2,10 +2,10 @@ package com.bdcricketscorer.bd_bluetooth_tv_remote
 
 import android.Manifest
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
-import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -26,19 +26,19 @@ class MainActivity : FlutterActivity() {
     private var pendingStart: MethodChannel.Result? = null
     private var appRegistered = false
     private var tvConnected = false
+    private var lastDeviceName = ""
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: Executor by lazy { ContextCompat.getMainExecutor(this) }
 
     private val descriptor = intArrayOf(
-
-        0x05,0x01,0x09,0x06,0xA1,0x01,
-        0x85,0x01,
+        // Keyboard report (Report ID 1): modifiers, reserved byte, six key usages.
+        0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x01,
         0x05,0x07,0x19,0xE0,0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,
         0x95,0x01,0x75,0x08,0x81,0x01,
         0x95,0x06,0x75,0x08,0x15,0x00,0x25,0x76,0x05,0x07,0x19,0x00,0x29,0x76,0x81,0x00,0xC0,
+        // Consumer control report (Report ID 2): 16-bit consumer usage.
         0x05,0x0C,0x09,0x01,0xA1,0x01,0x85,0x02,
         0x15,0x00,0x26,0xFF,0x03,0x19,0x00,0x2A,0xFF,0x03,0x75,0x10,0x95,0x01,0x81,0x00,0xC0
-    
     ).let { values -> ByteArray(values.size) { index -> values[index].toByte() } }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -46,9 +46,12 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startHid" -> startHid(result)
+                "getHidStatus" -> result.success(hidStatus())
+                "getPairedDevices" -> result.success(pairedDevices())
+                "connectDevice" -> connectDevice(call.argument<String>("address") ?: "", result)
+                "disconnectDevice" -> disconnectDevice(call.argument<String>("address") ?: "", result)
                 "sendKey" -> sendKeyboardKey(call.argument<Int>("key") ?: 0, result)
                 "sendConsumer" -> sendConsumer(call.argument<Int>("usage") ?: 0, result)
-                "getHidStatus" -> result.success(mapOf("registered" to appRegistered, "connected" to tvConnected, "device" to (connectedDevice()?.name ?: "")))
                 else -> result.notImplemented()
             }
         }
@@ -75,47 +78,86 @@ class MainActivity : FlutterActivity() {
             startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
             result.error("BLUETOOTH_OFF", "Turn Bluetooth on, then tap Start Bluetooth Remote again.", null); return
         }
+        if (appRegistered && hid != null) {
+            makeDiscoverable()
+            result.success("ready")
+            return
+        }
+
         pendingStart = result
         val opened = adapter.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile?) {
                 if (profile != BluetoothProfile.HID_DEVICE || proxy !is BluetoothHidDevice) return
                 hid = proxy
                 val callback = object : BluetoothHidDevice.Callback() {
-                    override fun onAppStatusChanged(device: android.bluetooth.BluetoothDevice?, registered: Boolean) {
+                    override fun onAppStatusChanged(device: BluetoothDevice?, registered: Boolean) {
                         appRegistered = registered
                         if (!registered) tvConnected = false
                         if (registered) {
-                            try { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)) } catch (_: Exception) {}
-                            pendingStart?.success("ready"); pendingStart = null
+                            makeDiscoverable()
+                            pendingStart?.success("ready")
+                            pendingStart = null
                         } else {
-                            pendingStart?.error("REGISTER_FAILED", "Bluetooth HID registration failed.", null); pendingStart = null
+                            pendingStart?.error("REGISTER_FAILED", "Bluetooth HID registration failed.", null)
+                            pendingStart = null
                         }
                     }
-                    override fun onConnectionStateChanged(device: android.bluetooth.BluetoothDevice?, state: Int) { tvConnected = state == BluetoothProfile.STATE_CONNECTED }
+
+                    override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
+                        tvConnected = state == BluetoothProfile.STATE_CONNECTED
+                        if (device != null && tvConnected) {
+                            try { lastDeviceName = device.name ?: device.address } catch (_: SecurityException) { lastDeviceName = "" }
+                        } else if (!tvConnected) {
+                            lastDeviceName = ""
+                        }
+                    }
                 }
                 try {
-                    val sdp = BluetoothHidDeviceAppSdpSettings("BD TV Remote", "Bluetooth HID TV Remote", "BD Remote", BluetoothHidDevice.SUBCLASS1_COMBO, descriptor)
+                    // This app sends keyboard and consumer-control reports, not mouse reports.
+                    val sdp = BluetoothHidDeviceAppSdpSettings(
+                        "Bluetooth Remote",
+                        "Bluetooth HID TV Remote",
+                        "Bluetooth Remote",
+                        BluetoothHidDevice.SUBCLASS1_KEYBOARD,
+                        descriptor
+                    )
                     val accepted = proxy.registerApp(sdp, null, null, executor, callback)
-                    // Android documents that registerApp()'s return value is not the
-                    // registration status. Wait for onAppStatusChanged() instead.
                     mainHandler.postDelayed({
                         if (pendingStart != null && !appRegistered) {
                             val reason = if (!accepted) {
-                                "Android did not accept the HID registration request. This can happen if another HID app is registered or the phone's Bluetooth service blocks HID Device mode."
+                                "Android rejected the HID registration request. Another HID app may be registered."
                             } else {
-                                "Android did not confirm HID registration. The phone firmware may not support third-party Bluetooth HID Device mode."
+                                "Android did not confirm HID registration. The phone firmware may not support third-party HID Device mode."
                             }
                             pendingStart?.error("HID_REGISTRATION_TIMEOUT", reason, null)
                             pendingStart = null
                         }
-                    }, 6000)
+                    }, 8000)
                 } catch (e: SecurityException) {
                     pendingStart?.error("PERMISSION", e.message, null); pendingStart = null
+                } catch (e: Exception) {
+                    pendingStart?.error("HID_ERROR", e.message, null); pendingStart = null
                 }
             }
-            override fun onServiceDisconnected(profile: Int) { hid = null; appRegistered = false; tvConnected = false }
+
+            override fun onServiceDisconnected(profile: Int) {
+                hid = null
+                appRegistered = false
+                tvConnected = false
+                lastDeviceName = ""
+            }
         }, BluetoothProfile.HID_DEVICE)
-        if (!opened) { result.error("PROFILE_UNAVAILABLE", "This phone does not expose the Bluetooth HID Device profile.", null); pendingStart = null }
+        if (!opened) {
+            result.error("PROFILE_UNAVAILABLE", "This phone does not expose the Bluetooth HID Device profile.", null)
+            pendingStart = null
+        }
+    }
+
+    private fun makeDiscoverable() {
+        try {
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300))
+        } catch (_: Exception) { }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -129,14 +171,82 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun connectedDevice(): android.bluetooth.BluetoothDevice? {
-        if (!appRegistered || hid == null) return null
+    private fun adapter(): BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
+
+    private fun pairedDevices(): List<Map<String, Any?>> {
+        if (!hasBluetoothPermissions()) return emptyList()
+        return try {
+            adapter()?.bondedDevices
+                ?.map { device ->
+                    val state = try { hid?.getConnectionState(device) ?: BluetoothProfile.STATE_DISCONNECTED }
+                    catch (_: Exception) { BluetoothProfile.STATE_DISCONNECTED }
+                    mapOf(
+                        "name" to (device.name ?: "Bluetooth device"),
+                        "address" to device.address,
+                        "bonded" to (device.bondState == BluetoothDevice.BOND_BONDED),
+                        "connected" to (state == BluetoothProfile.STATE_CONNECTED),
+                        "connecting" to (state == BluetoothProfile.STATE_CONNECTING)
+                    )
+                } ?: emptyList()
+        } catch (_: SecurityException) { emptyList() }
+    }
+
+    private fun hidStatus(): Map<String, Any?> {
+        val devices = pairedDevices()
+        val connected = devices.firstOrNull { it["connected"] == true }
+        return mapOf(
+            "registered" to appRegistered,
+            "connected" to (connected != null || tvConnected),
+            "device" to (connected?.get("name") ?: lastDeviceName),
+            "pairedDevices" to devices
+        )
+    }
+
+    private fun findBondedDevice(address: String): BluetoothDevice? {
+        if (!hasBluetoothPermissions() || address.isBlank()) return null
+        return try { adapter()?.bondedDevices?.firstOrNull { it.address.equals(address, true) } }
+        catch (_: SecurityException) { null }
+    }
+
+    private fun connectDevice(address: String, result: MethodChannel.Result) {
+        val device = findBondedDevice(address)
+        if (device == null) {
+            result.error("DEVICE_NOT_PAIRED", "এই TV ফোনের Bluetooth paired list-এ নেই। আগে TV থেকে ফোনটি pair করুন।", null)
+            return
+        }
+        val profile = hid
+        if (!appRegistered || profile == null) {
+            result.error("HID_NOT_READY", "আগে Start Bluetooth Remote চাপুন।", null)
+            return
+        }
+        try {
+            val accepted = profile.connect(device)
+            if (accepted) result.success(true)
+            else result.error("CONNECT_REJECTED", "Android HID connection request গ্রহণ করেনি। TV-তে আগের pairing মুছে আবার pair করুন।", null)
+        } catch (e: SecurityException) {
+            result.error("PERMISSION", e.message, null)
+        } catch (e: Exception) {
+            result.error("CONNECT_FAILED", e.message, null)
+        }
+    }
+
+    private fun disconnectDevice(address: String, result: MethodChannel.Result) {
+        val device = findBondedDevice(address)
+        if (device == null) { result.error("DEVICE_NOT_FOUND", "Paired TV পাওয়া যায়নি।", null); return }
+        try {
+            val ok = hid?.disconnect(device) == true
+            if (ok) result.success(true) else result.error("DISCONNECT_FAILED", "Disconnect request failed.", null)
+        } catch (e: Exception) { result.error("DISCONNECT_FAILED", e.message, null) }
+    }
+
+    private fun connectedDevice(): BluetoothDevice? {
+        if (!appRegistered || hid == null || !hasBluetoothPermissions()) return null
         return try { hid?.connectedDevices?.firstOrNull() } catch (_: SecurityException) { null }
     }
 
     private fun sendKeyboardKey(key: Int, result: MethodChannel.Result) {
         val device = connectedDevice()
-        if (device == null) { result.error("NOT_PAIRED", "Pair this phone from the TV Bluetooth accessories menu first.", null); return }
+        if (device == null) { result.error("NOT_PAIRED", "আগে HY320mini-এর সঙ্গে Bluetooth Remote connect করুন।", null); return }
         try {
             val press = byteArrayOf(0, 0, key.toByte(), 0, 0, 0, 0, 0)
             val release = ByteArray(8)
@@ -148,7 +258,7 @@ class MainActivity : FlutterActivity() {
 
     private fun sendConsumer(usage: Int, result: MethodChannel.Result) {
         val device = connectedDevice()
-        if (device == null) { result.error("NOT_PAIRED", "Pair this phone from the TV Bluetooth accessories menu first.", null); return }
+        if (device == null) { result.error("NOT_PAIRED", "আগে HY320mini-এর সঙ্গে Bluetooth Remote connect করুন।", null); return }
         try {
             val press = byteArrayOf((usage and 0xFF).toByte(), ((usage shr 8) and 0xFF).toByte())
             val release = byteArrayOf(0, 0)
